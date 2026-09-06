@@ -161,7 +161,13 @@ public class DiagramStrategy : Strategy, INotifyPropertiesChanged
 			throw new ArgumentNullException(nameof(composition));
 
 		if (_compositionSettings != null)
+		{
 			composition.Load(_compositionSettings);
+
+			// The field carries settings across the gap where no composition exists. Once a composition
+			// has taken them it holds them itself, and a copy left behind here would outlive the truth.
+			_compositionSettings = null;
+		}
 
 		composition.Changed += OnCompositionChanged;
 		composition.PropertiesChanged += RaisePropertiesChanged;
@@ -185,8 +191,6 @@ public class DiagramStrategy : Strategy, INotifyPropertiesChanged
 		composition.Parent = null;
 		composition.Changed -= OnCompositionChanged;
 		composition.PropertiesChanged -= RaisePropertiesChanged;
-
-		_compositionSettings = composition.Save();
 	}
 
 	private void OnCompositionChanged()
@@ -400,13 +404,21 @@ public class DiagramStrategy : Strategy, INotifyPropertiesChanged
 		var composition = Composition;
 
 		if (composition != null)
-			storage.SetValue(_compositionKey, _compositionSettings = composition.Save());
+			storage.SetValue(_compositionKey, composition.Save());
 	}
 
 	/// <inheritdoc />
 	public override void Load(SettingsStorage storage)
 	{
-		Composition?.LoadIfNotNull(storage, _compositionKey);
+		if (Composition is null)
+		{
+			// Settings can arrive before a composition does -- a clone is loaded before its diagram is
+			// copied in -- so they wait here until there is something to load them into.
+			if (storage.ContainsKey(_compositionKey))
+				_compositionSettings = storage.GetValue<SettingsStorage>(_compositionKey);
+		}
+		else
+			Composition.LoadIfNotNull(storage, _compositionKey);
 
 		base.Load(storage);
 	}
