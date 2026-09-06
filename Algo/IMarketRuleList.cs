@@ -18,6 +18,17 @@ public interface IMarketRuleList : INotifyList<IMarketRule>, ISynchronizedCollec
 	IEnumerable<IMarketRule> GetRulesByToken(object token);
 
 	/// <summary>
+	/// Takes a rule into the container, and says whether it was taken.
+	/// </summary>
+	/// <param name="rule">The rule.</param>
+	/// <returns><see langword="true"/> when the container holds the rule afterwards.</returns>
+	/// <remarks>
+	/// A container may turn a rule away - a strategy takes none once it is stopping - and
+	/// <see cref="ICollection{T}.Add"/> cannot say so, having nothing to return.
+	/// </remarks>
+	bool TryAdd(IMarketRule rule);
+
+	/// <summary>
 	/// Delete all rules, for which <see cref="IMarketRule.Token"/> is equal to <paramref name="token" />.
 	/// </summary>
 	/// <param name="token">Token rules.</param>
@@ -41,6 +52,14 @@ public class MarketRuleList(IMarketRuleContainer container) : SynchronizedSet<IM
 	/// Adding the element.
 	/// </summary>
 	/// <param name="item">Element.</param>
+	/// <inheritdoc />
+	public bool TryAdd(IMarketRule rule)
+	{
+		Add(rule);
+
+		return Contains(rule);
+	}
+
 	protected override void OnAdded(IMarketRule item)
 	{
 		if (item.Token != null)

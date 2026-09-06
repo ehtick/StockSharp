@@ -8,9 +8,15 @@ public class MarketRuleTests : BaseTestClass
 		private readonly Lock _rulesSuspendLock = new();
 		private int _rulesSuspendCount;
 
-		public MarketRuleContainer()
+		public MarketRuleContainer(bool refuseRules = false)
 		{
-			_rules = new MarketRuleList(this);
+			_rules = refuseRules ? new RefusingRuleList(this) : new MarketRuleList(this);
+		}
+
+		// A strategy takes no new rules once it is stopping; this is that container.
+		private sealed class RefusingRuleList(IMarketRuleContainer container) : MarketRuleList(container)
+		{
+			protected override bool OnAdding(IMarketRule item) => false;
 		}
 
 		ProcessStates IMarketRuleContainer.ProcessState => ProcessStates.Started;
@@ -1516,5 +1522,23 @@ public class MarketRuleTests : BaseTestClass
 		r.Dispose();
 		r.IsReady.AssertFalse();
 		ThrowsExactly<ObjectDisposedException>(() => r.Trigger());
+	}
+
+	[TestMethod]
+	public void RefusedRuleStaysQuiet()
+	{
+		// A strategy stops taking rules the moment it starts stopping, while the order it was asked to
+		// register still fails afterwards. The rule wired to that failure then fires belonging to no one,
+		// and that is an ordinary end of a session, not a fault of whoever built the rule.
+		IMarketRuleContainer container = new MarketRuleContainer(refuseRules: true);
+		var fired = false;
+		var rule = new TestRule().Apply(container).Do(_ => fired = true);
+
+		container.Rules.Count.AssertEqual(0);
+		rule.Container.AssertNull();
+
+		((TestRule)rule).Trigger();
+
+		fired.AssertFalse();
 	}
 }
