@@ -367,7 +367,7 @@ public class StrategyDecomposedEquivalenceTests : BaseTestClass
 	/// strategy's Bind mechanism processed.
 	/// Uses a deterministic random provider so the emulator's behavior is reproducible.
 	/// </summary>
-	private async Task<(SmaStrategy strategy, List<ICandleMessage> candles)> RunSmaBacktestWithCandles(CancellationToken ct)
+	private async Task<(SmaStrategy strategy, List<ICandleMessage> candles, List<Order> sent)> RunSmaBacktestWithCandles(CancellationToken ct)
 	{
 		var security = new Security { Id = Paths.HistoryDefaultSecurity };
 		var portfolio = Portfolio.CreateSimulator();
@@ -417,6 +417,16 @@ public class StrategyDecomposedEquivalenceTests : BaseTestClass
 			capturedCandles.Add(candle);
 		};
 
+		// Every order the strategy sends, in the order it sent them.
+		//
+		// Not `strategy.Orders`: that is the key array of a dictionary the strategy prunes as it
+		// runs — OrdersKeepTime defaults to a day, and every registration drops the Done orders
+		// older than that — so over a month it holds neither all the orders nor the earliest one,
+		// and the freed slots are reused, which leaves the keys in no particular order at all.
+		// This test is about what the strategy decided, so it watches the deciding.
+		var sentOrders = new List<Order>();
+		strategy.OrderRegistering += sentOrders.Add;
+
 		var tcs = new TaskCompletionSource<bool>();
 		connector.StateChanged2 += state =>
 		{
@@ -440,7 +450,7 @@ public class StrategyDecomposedEquivalenceTests : BaseTestClass
 
 		Console.WriteLine($"Backtest done: state={strategy.ProcessState}, orders={strategy.Orders.Count()}, trades={strategy.MyTrades.Count()}, candles={capturedCandles.Count}, position={strategy.Position}");
 
-		return (strategy, capturedCandles);
+		return (strategy, capturedCandles, sentOrders);
 	}
 
 	#endregion
@@ -991,9 +1001,9 @@ public class StrategyDecomposedEquivalenceTests : BaseTestClass
 		if (SkipIfNoHistoryData()) return;
 
 		// 1. Run real SmaStrategy backtest and capture candles
-		var (sma, candles) = await RunSmaBacktestWithCandles(CancellationToken);
+		var (sma, candles, sentOrders) = await RunSmaBacktestWithCandles(CancellationToken);
 
-		var origOrders = sma.Orders.ToArray();
+		var origOrders = sentOrders.ToArray();
 
 		IsTrue(origOrders.Length > 0, "SmaStrategy must generate orders");
 		IsTrue(candles.Count > 0, "Expected captured candles from backtest");

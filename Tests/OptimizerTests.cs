@@ -508,14 +508,18 @@ public class OptimizerTests : BaseTestClass
 			DateTime? lastEventTime = null;
 			var strategyErrors = new List<string>();
 
+			// Order.Time is when the order was REGISTERED, not when this notification was raised, and
+			// it does not move when the order later fills or is cancelled. An order that rests
+			// across a bar is therefore reported after trades that are stamped later than it, which
+			// is correct and says nothing about the clock. What it may not do is claim a
+			// registration time the run has not reached yet, so that is what is checked.
 			strategy.OrderReceived += (sub, order) =>
 			{
 				var time = order.Time;
-				if (lastEventTime.HasValue && time < lastEventTime.Value)
+				if (time > strategy.CurrentTime)
 				{
-					strategyErrors.Add($"Order time {time} < last event time {lastEventTime.Value}");
+					strategyErrors.Add($"Order registered at {time}, ahead of the run's {strategy.CurrentTime}");
 				}
-				lastEventTime = time;
 			};
 
 			strategy.OwnTradeReceived += (sub, trade) =>
