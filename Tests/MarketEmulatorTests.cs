@@ -34,6 +34,47 @@ public class MarketEmulatorTests : BaseTestClass
 		}, CancellationToken);
 	}
 
+	/// <summary>
+	/// A fill is reported before the order state that fill produced. A reader releasing per-order
+	/// state on a final state - the slippage manager releases the price the order was planned at -
+	/// must still hold it when the trade arrives, so the order of these messages is a contract.
+	/// </summary>
+	[TestMethod]
+	public async Task AFillIsReportedBeforeTheOrderStateItProduced()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+		var now = DateTime.UtcNow;
+
+		await AddBookAsync(emu, id, now);
+
+		var reg = new OrderRegisterMessage
+		{
+			SecurityId = id,
+			TransactionId = _idGenerator.GetNextId(),
+			Side = Sides.Buy,
+			Volume = 1,
+			OrderType = OrderTypes.Market,
+			PortfolioName = _pfName,
+			LocalTime = now,
+		};
+		await emu.SendInMessageAsync(reg, CancellationToken);
+
+		var mine = res
+			.OfType<ExecutionMessage>()
+			.Where(m => m.OriginalTransactionId == reg.TransactionId)
+			.ToArray();
+
+		var fillAt = mine.IndexOf(mine.FirstOrDefault(m => m.HasTradeInfo()));
+		var doneAt = mine.IndexOf(mine.FirstOrDefault(m => !m.HasTradeInfo() && m.HasOrderInfo() && m.OrderState?.IsFinal() == true));
+
+		var seq = mine.Select((m, i) => $"{i}:{(m.HasTradeInfo() ? "trade" : "order")}/{m.OrderState}/bal={m.Balance}").JoinComma();
+
+		IsTrue(fillAt >= 0, $"the market order did not fill: {seq}");
+		IsTrue(doneAt >= 0, $"the order never reported a final state: {seq}");
+		IsTrue(fillAt < doneAt, $"the order was reported final at {doneAt} before its fill at {fillAt}: {seq}");
+	}
+
 	[TestMethod]
 	public async Task OrderMatcher()
 	{

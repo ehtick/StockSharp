@@ -154,6 +154,9 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		try
 		{
 			ProcessMessage(message, results);
+
+			// Once per batch: the manager accumulates, so a trade swept twice is charged twice.
+			ApplyCommissions(results);
 		}
 		catch (Exception ex)
 		{
@@ -187,6 +190,11 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 	private void ProcessMessage(Message message, List<Message> results)
 	{
 		SyncEngineSettings();
+
+		// A bar that closed by now reaches the book before this message acts on it. Forward only:
+		// an order is stamped with the bar it reacted to, which is behind where the run has got to.
+		if (message.LocalTime >= _currentTime)
+			ProcessTime(message.LocalTime, results);
 
 		switch (message.Type)
 		{
@@ -246,19 +254,13 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 
 			case MessageTypes.OrderReplace:
 			{
-				var engineResults = new List<Message>();
-				_engine.ProcessMessage(message, engineResults);
-				ApplyCommissions(engineResults);
-				results.AddRange(engineResults);
+				_engine.ProcessMessage(message, results);
 				break;
 			}
 
 			case MessageTypes.OrderGroupCancel:
 			{
-				var engineResults = new List<Message>();
-				_engine.ProcessMessage(message, engineResults);
-				ApplyCommissions(engineResults);
-				results.AddRange(engineResults);
+				_engine.ProcessMessage(message, results);
 				break;
 			}
 
@@ -319,13 +321,68 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		ProcessTime(message.LocalTime, results);
 	}
 
+	/// <summary>
+	/// Replay a closed candle as the prices it recorded, in the order it recorded them.
+	/// </summary>
+	/// <remarks>
+	/// Each print moves the book and sweeps the resting orders as a real one does. They are not
+	/// published: whoever asked for candles gets candles.
+	/// </remarks>
+	private void ReplayCandle(SecurityId securityId, SecurityEmulator emulator, CandleMessage candle, DateTime time, List<Message> results)
+	{
+		// Without recorded extreme times, a bar that closed up is walked low-first and one that
+		// closed down high-first - the path that reaches both without retracing twice.
+		var highFirst = candle.HighTime != default && candle.LowTime != default
+			? candle.HighTime <= candle.LowTime
+			: candle.ClosePrice < candle.OpenPrice;
+
+		var prices = highFirst
+			? new[] { candle.OpenPrice, candle.HighPrice, candle.LowPrice, candle.ClosePrice }
+			: new[] { candle.OpenPrice, candle.LowPrice, candle.HighPrice, candle.ClosePrice };
+
+		// The bar's own volume, spread over the prints that stand for it.
+		var volume = candle.TotalVolume > 0 ? candle.TotalVolume / prices.Length : 0m;
+
+		// What the market held. With IncreaseDepthVolume on - the default - a level is deep enough
+		// that nothing an order asks for is refused, as it is for a real print. With it off, the
+		// bar's own traded volume is the cap, which is the whole of what the setting says.
+		var levelVolume = Settings.IncreaseDepthVolume || candle.TotalVolume <= 0
+			? SecurityEmulator.EmulatedLevelVolume
+			: candle.TotalVolume;
+
+		decimal? previous = null;
+
+		foreach (var price in prices)
+		{
+			// A bar can hold fewer than four distinct prices; repeating one moves nothing.
+			if (previous == price)
+				continue;
+
+			previous = price;
+
+			var print = new ExecutionMessage
+			{
+				DataTypeEx = DataType.Ticks,
+				SecurityId = securityId,
+				LocalTime = time,
+				ServerTime = time,
+				TradePrice = price,
+				TradeVolume = volume,
+			};
+
+			emulator.ProcessTick(print, levelVolume, results);
+			_engine.CheckStopOrders(securityId, price, time, results);
+			CheckLimitOrders(securityId, price, time, results);
+		}
+	}
+
 	private void ProcessExecution(ExecutionMessage execMsg, List<Message> results)
 	{
 		var emulator = GetEmulator(execMsg.SecurityId);
 
 		if (execMsg.DataType == DataType.Ticks)
 		{
-			emulator.ProcessTick(execMsg, results);
+			emulator.ProcessTick(execMsg, SecurityEmulator.EmulatedLevelVolume, results);
 			if (execMsg.TradePrice is { } tickPrice)
 			{
 				_engine.CheckStopOrders(execMsg.SecurityId, tickPrice, execMsg.LocalTime, results);
@@ -440,22 +497,6 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		state.OrderBook.RemoveQuote(order.TransactionId, order.Side, order.Price);
 		state.OrderManager.TryRemoveOrder(order.TransactionId, out _);
 
-		results.Add(new ExecutionMessage
-		{
-			DataTypeEx = DataType.Transactions,
-			LocalTime = time,
-			ServerTime = time,
-			SecurityId = state.SecurityId,
-			OrderId = order.OrderId,
-			OriginalTransactionId = order.TransactionId,
-			Side = order.Side,
-			Balance = 0,
-			OrderVolume = order.Volume,
-			OrderState = OrderStates.Done,
-			PortfolioName = order.PortfolioName,
-			HasOrderInfo = true,
-		});
-
 		var tradeMsg = new ExecutionMessage
 		{
 			DataTypeEx = DataType.Transactions,
@@ -474,7 +515,25 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		var portfolio = _engine.PortfolioManager.GetPortfolio(order.PortfolioName);
 		var (_, _, position) = portfolio.ProcessTrade(state.SecurityId, order.Side, fillPrice, volume, tradeMsg.Commission);
 
+		// The fill before the state it produced: a reader releasing per-order state on a final
+		// state must still hold it when the trade arrives.
 		results.Add(tradeMsg);
+
+		results.Add(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			LocalTime = time,
+			ServerTime = time,
+			SecurityId = state.SecurityId,
+			OrderId = order.OrderId,
+			OriginalTransactionId = order.TransactionId,
+			Side = order.Side,
+			Balance = 0,
+			OrderVolume = order.Volume,
+			OrderState = OrderStates.Done,
+			PortfolioName = order.PortfolioName,
+			HasOrderInfo = true,
+		});
 
 		results.Add(new PositionChangeMessage
 		{
@@ -491,243 +550,8 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 
 	private void ProcessOrderRegister(OrderRegisterMessage regMsg, List<Message> results)
 	{
-		var emulator = GetEmulator(regMsg.SecurityId);
-
-		// Candle matching is emulation-specific
-		var candle = emulator.HasCandleSubscription ? emulator.GetLastStoredCandle() : null;
-
-		if (candle is not null)
-		{
-			ProcessOrderRegisterWithCandle(regMsg, emulator, candle, results);
-		}
-		else
-		{
-			// Delegate to engine for standard matching
-			var beforeCount = results.Count;
-			_engine.ProcessOrderRegister(regMsg, results);
-			ApplyCommissions(results, beforeCount);
-		}
-	}
-
-	private void ProcessOrderRegisterWithCandle(OrderRegisterMessage regMsg, SecurityEmulator emulator, CandleMessage candle, List<Message> results)
-	{
-		// Stop order interception
-		if (regMsg.OrderType == OrderTypes.Conditional && regMsg.Condition is IStopLossOrderCondition)
-		{
-			_engine.ProcessOrderRegister(regMsg, results);
-			return;
-		}
-
-		var state = _engine.GetSecurityState(regMsg.SecurityId);
-		var portfolio = _engine.PortfolioManager.GetPortfolio(regMsg.PortfolioName);
-		var serverTime = regMsg.LocalTime;
-
-		// Validate. In candle mode the charge comes from the candle, not from a book.
-		var error = _engine.ValidateRegistration(regMsg, GetCandleExecutionPrice(regMsg.OrderType, regMsg.Price, candle));
-		if (error != null)
-		{
-			results.Add(CreateOrderResponse(regMsg, OrderStates.Failed, error: error));
-			return;
-		}
-
-		var replyMsg = new ExecutionMessage
-		{
-			HasOrderInfo = true,
-			DataTypeEx = DataType.Transactions,
-			ServerTime = serverTime,
-			LocalTime = regMsg.LocalTime,
-			OriginalTransactionId = regMsg.TransactionId,
-			Side = regMsg.Side,
-			// Report acceptance as Active; expiry or a full fill overwrites this below, but an order that
-			// fills immediately against the candle still passes through Active so acceptance is reported.
-			OrderState = OrderStates.Active,
-		};
-		results.Add(replyMsg);
-
-		var marginPrice = 0m; // candle mode — no book
-
-		var order = new EmulatorOrder
-		{
-			TransactionId = regMsg.TransactionId,
-			Side = regMsg.Side,
-			Price = regMsg.Price,
-			Balance = regMsg.Volume,
-			Volume = regMsg.Volume,
-			PortfolioName = regMsg.PortfolioName,
-			TimeInForce = regMsg.TimeInForce,
-			OrderType = regMsg.OrderType,
-			PostOnly = regMsg.PostOnly ?? false,
-			ExpiryDate = regMsg.TillDate,
-			ServerTime = serverTime,
-			LocalTime = regMsg.LocalTime,
-			MarginPrice = marginPrice,
-		};
-
-		var orderId = _engine.OrderIdGenerator.GetNextId();
-		order.OrderId = orderId;
-
-		portfolio.ProcessOrderRegistration(regMsg.SecurityId, regMsg.Side, regMsg.Volume, marginPrice);
-		AddPortfolioUpdate(portfolio, regMsg.LocalTime, results);
-
-		var matchResult = MatchOrderByCandle(order, candle, Settings.IncreaseDepthVolume);
-
-		if (matchResult.IsRejected)
-		{
-			portfolio.ProcessOrderCancellation(regMsg.SecurityId, regMsg.Side, regMsg.Volume, marginPrice);
-
-			replyMsg.OrderState = OrderStates.Done;
-			replyMsg.Balance = regMsg.Volume;
-			replyMsg.OrderVolume = regMsg.Volume;
-			replyMsg.Error = new InvalidOperationException(matchResult.RejectionReason);
-			return;
-		}
-
-		var isIOC = regMsg.TimeInForce == TimeInForce.CancelBalance;
-		var isFOK = regMsg.TimeInForce == TimeInForce.MatchOrCancel;
-		// A market order cannot rest either, so its unfilled balance is cancelled the same way.
-		var isMarket = regMsg.OrderType == OrderTypes.Market;
-		var hasTrades = matchResult.Trades.Count > 0;
-
-		var marketPrice = regMsg.Side == Sides.Buy
-			? state.OrderBook.BestAsk?.price
-			: state.OrderBook.BestBid?.price;
-
-		if ((isIOC || isFOK) && hasTrades)
-		{
-			results.Add(new ExecutionMessage
-			{
-				LocalTime = regMsg.LocalTime,
-				SecurityId = regMsg.SecurityId,
-				OrderId = orderId,
-				OriginalTransactionId = regMsg.TransactionId,
-				Balance = matchResult.RemainingVolume,
-				OrderVolume = regMsg.Volume,
-				OrderState = OrderStates.Done,
-				Side = regMsg.Side,
-				PortfolioName = regMsg.PortfolioName,
-				DataTypeEx = DataType.Transactions,
-				HasOrderInfo = true,
-				ServerTime = serverTime,
-			});
-		}
-
-		foreach (var trade in matchResult.Trades)
-		{
-			var tradeId = _engine.TradeIdGenerator.GetNextId();
-
-			var tradeMsg = new ExecutionMessage
-			{
-				DataTypeEx = DataType.Transactions,
-				SecurityId = regMsg.SecurityId,
-				LocalTime = regMsg.LocalTime,
-				ServerTime = serverTime,
-				OriginalTransactionId = regMsg.TransactionId,
-				OrderId = orderId,
-				TradeId = tradeId,
-				TradePrice = trade.Price,
-				TradeVolume = trade.Volume,
-				Side = regMsg.Side,
-				PortfolioName = regMsg.PortfolioName,
-				MarketPrice = marketPrice,
-			};
-
-			tradeMsg.Commission = _commissionManager.Process(tradeMsg);
-
-			var (_, _, position) = portfolio.ProcessTrade(
-				regMsg.SecurityId, regMsg.Side, trade.Price, trade.Volume, tradeMsg.Commission);
-
-			if (!isIOC && !isFOK)
-			{
-				results.Add(new ExecutionMessage
-				{
-					DataTypeEx = DataType.Transactions,
-					LocalTime = regMsg.LocalTime,
-					ServerTime = serverTime,
-					SecurityId = regMsg.SecurityId,
-					OrderId = orderId,
-					OriginalTransactionId = regMsg.TransactionId,
-					Balance = matchResult.RemainingVolume,
-					OrderVolume = regMsg.Volume,
-					OrderState = matchResult.FinalState,
-					Side = regMsg.Side,
-					PortfolioName = regMsg.PortfolioName,
-					HasOrderInfo = true,
-				});
-			}
-
-			results.Add(tradeMsg);
-
-			// Named after the traded instrument, not money: the value carried here is a lot
-			// quantity, and the account's cash follows on its own row from AddPortfolioUpdate.
-			results.Add(new PositionChangeMessage
-			{
-				SecurityId = regMsg.SecurityId,
-				ServerTime = serverTime,
-				LocalTime = regMsg.LocalTime,
-				PortfolioName = regMsg.PortfolioName,
-			}
-			.Add(PositionChangeTypes.CurrentValue, position.CurrentValue)
-			.TryAdd(PositionChangeTypes.AveragePrice, position.AveragePrice));
-
-			AddPortfolioUpdate(portfolio, regMsg.LocalTime, results);
-		}
-
-		var isCancelled = matchResult.FinalState == OrderStates.Done && matchResult.RemainingVolume > 0;
-
-		if ((isIOC || isFOK || isMarket) && isCancelled)
-		{
-			if (!hasTrades)
-			{
-				results.Add(new ExecutionMessage
-				{
-					LocalTime = regMsg.LocalTime,
-					SecurityId = regMsg.SecurityId,
-					OrderId = orderId,
-					OriginalTransactionId = regMsg.TransactionId,
-					Balance = matchResult.RemainingVolume,
-					OrderVolume = regMsg.Volume,
-					OrderState = OrderStates.Done,
-					Side = regMsg.Side,
-					PortfolioName = regMsg.PortfolioName,
-					DataTypeEx = DataType.Transactions,
-					HasOrderInfo = true,
-					ServerTime = serverTime,
-				});
-			}
-
-			portfolio.ProcessOrderCancellation(regMsg.SecurityId, regMsg.Side, matchResult.RemainingVolume, marginPrice);
-			AddPortfolioUpdate(portfolio, regMsg.LocalTime, results);
-		}
-		else if (matchResult.Trades.Count == 0)
-		{
-			replyMsg.OrderState = matchResult.FinalState;
-			if (matchResult.FinalState != OrderStates.Active)
-			{
-				replyMsg.Balance = matchResult.RemainingVolume;
-				replyMsg.OrderVolume = regMsg.Volume;
-			}
-		}
-
-		if (matchResult.ShouldPlaceInBook && matchResult.RemainingVolume > 0)
-		{
-			if (regMsg.TillDate.HasValue && regMsg.TillDate.Value <= regMsg.LocalTime)
-			{
-				replyMsg.OrderState = OrderStates.Done;
-				replyMsg.Balance = matchResult.RemainingVolume;
-				replyMsg.OrderVolume = regMsg.Volume;
-			}
-			else
-			{
-				order.Balance = matchResult.RemainingVolume;
-				state.OrderBook.AddQuote(order);
-				state.OrderManager.RegisterOrder(order, regMsg.LocalTime);
-			}
-		}
-
-		if (state.HasDepthSubscription)
-		{
-			results.Add(state.OrderBook.ToMessage(regMsg.LocalTime, serverTime));
-		}
+		// One matcher, whatever the input was: candles reach the book through ReplayCandle.
+		_engine.ProcessOrderRegister(regMsg, results);
 	}
 
 	private void ProcessTime(DateTime time, List<Message> results)
@@ -760,93 +584,11 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		}
 
 		// Emulation handles stored candles
-		foreach (var emulator in _securityEmulators.Values)
+		foreach (var (secId, emulator) in _securityEmulators)
 		{
-			emulator.ProcessStoredCandles(time, results);
+			foreach (var candle in emulator.ProcessStoredCandles(time, results) ?? [])
+				ReplayCandle(secId, emulator, candle, time, results);
 		}
-	}
-
-	/// <summary>
-	/// Price a candle fills an order at: the order's own price when it names one, the candle's mid
-	/// (its close when the mid falls outside the candle) for a market order.
-	/// </summary>
-	private static decimal GetCandleExecutionPrice(OrderTypes? orderType, decimal orderPrice, CandleMessage candle)
-	{
-		if (orderType != OrderTypes.Market)
-			return orderPrice;
-
-		var mid = (candle.HighPrice + candle.LowPrice) / 2;
-
-		return mid > candle.HighPrice || mid < candle.LowPrice ? candle.ClosePrice : mid;
-	}
-
-	/// <summary>
-	/// Match order against candle data directly.
-	/// </summary>
-	private static MatchResult MatchOrderByCandle(EmulatorOrder order, CandleMessage candle, bool increaseVolume)
-	{
-		var balance = order.Balance;
-
-		// A candle records what the market traded, not how much an order is allowed to fill. That
-		// is what MarketEmulatorSettings.IncreaseDepthVolume decides, the same setting the order
-		// book path answers by extending the book past its worst level, so an order asking for
-		// more than the market holds fills in full here too. With it off the candle's own volume
-		// is the cap, and a market order's remainder is cancelled below.
-		var available = increaseVolume || candle.TotalVolume == 0 ? balance : candle.TotalVolume;
-		var leftBalance = 0m.Max(balance - available);
-
-		if (leftBalance > 0 && order.TimeInForce == TimeInForce.MatchOrCancel)
-		{
-			return new MatchResult
-			{
-				Order = order,
-				Trades = [],
-				MatchedOrders = [],
-				RemainingVolume = balance,
-				ShouldPlaceInBook = false,
-				FinalState = OrderStates.Done,
-			};
-		}
-
-		if (order.OrderType != OrderTypes.Market && (order.Price > candle.HighPrice || order.Price < candle.LowPrice))
-		{
-			return new MatchResult
-			{
-				Order = order,
-				Trades = [],
-				MatchedOrders = [],
-				RemainingVolume = balance,
-				ShouldPlaceInBook = order.TimeInForce != TimeInForce.CancelBalance,
-				FinalState = order.TimeInForce == TimeInForce.CancelBalance ? OrderStates.Done : OrderStates.Active,
-			};
-		}
-
-		var execPrice = GetCandleExecutionPrice(order.OrderType, order.Price, candle);
-
-		var tradeVolume = balance - leftBalance;
-		var trades = new List<MatchTrade>
-		{
-			new(execPrice, tradeVolume, order.Side, [])
-		};
-
-		// A market order names no price, so a balance it leaves has nowhere to rest: queuing it would
-		// put a level at zero into the book. It is cancelled instead, as OrderMatcher does for a
-		// market order the book cannot fill in full.
-		var isCancelBalance = order.TimeInForce == TimeInForce.CancelBalance || order.OrderType == OrderTypes.Market;
-
-		var isFullyMatched = leftBalance <= 0;
-		var finalState = isFullyMatched || isCancelBalance ? OrderStates.Done : OrderStates.Active;
-		var shouldPlaceInBook = !isFullyMatched && !isCancelBalance;
-
-		return new MatchResult
-		{
-			Order = order,
-			Trades = trades,
-			MatchedOrders = [],
-			RemainingVolume = leftBalance,
-			ShouldPlaceInBook = shouldPlaceInBook,
-			FinalState = finalState,
-		};
 	}
 
 	private void Reset()
@@ -861,9 +603,12 @@ public class MarketEmulator : BaseLogReceiver, IMarketEmulator
 		// since our caller already adds its own
 	}
 
-	private void ApplyCommissions(List<Message> messages, int startIndex = 0)
+	/// <summary>
+	/// Price every trade in this batch. Called once, where the batch leaves the emulator.
+	/// </summary>
+	private void ApplyCommissions(List<Message> messages)
 	{
-		for (var i = startIndex; i < messages.Count; i++)
+		for (var i = 0; i < messages.Count; i++)
 		{
 			if (messages[i] is ExecutionMessage exec && exec.DataType == DataType.Transactions && exec.TradeId is not null)
 			{
@@ -964,10 +709,9 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 	private decimal? _synthBidPrice;
 	private decimal? _synthAskPrice;
 
-	// Ample liquidity for the synthesized tick/level1 book so a marketable order fills fully in one
-	// trade rather than partially against the fractional data volume, which would leave a crossed
-	// remainder resting at a stale price and later fill counter orders off the candle.
-	private const decimal _emulatedLevelVolume = 1_000_000_000m;
+	// Ample liquidity for a synthesized level, so a marketable order fills fully in one trade
+	// rather than partially against the fractional data volume.
+	internal const decimal EmulatedLevelVolume = 1_000_000_000m;
 
 	public decimal PriceStep => _securityDefinition?.PriceStep ?? 0.01m;
 	public decimal VolumeStep => _securityDefinition?.VolumeStep ?? 1m;
@@ -1095,7 +839,7 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 			if (_synthBidPrice is decimal prevBid && prevBid != bidPrice.Value)
 				engineState.OrderBook.UpdateLevel(Sides.Buy, prevBid, 0);
 
-			engineState.OrderBook.UpdateLevel(Sides.Buy, bidPrice.Value, _emulatedLevelVolume);
+			engineState.OrderBook.UpdateLevel(Sides.Buy, bidPrice.Value, EmulatedLevelVolume);
 			_synthBidPrice = bidPrice.Value;
 		}
 
@@ -1104,7 +848,7 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 			if (_synthAskPrice is decimal prevAsk && prevAsk != askPrice.Value)
 				engineState.OrderBook.UpdateLevel(Sides.Sell, prevAsk, 0);
 
-			engineState.OrderBook.UpdateLevel(Sides.Sell, askPrice.Value, _emulatedLevelVolume);
+			engineState.OrderBook.UpdateLevel(Sides.Sell, askPrice.Value, EmulatedLevelVolume);
 			_synthAskPrice = askPrice.Value;
 		}
 
@@ -1116,7 +860,13 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 		return bidPrice is decimal b && askPrice is decimal a ? (b + a) / 2 : bidPrice ?? askPrice;
 	}
 
-	public void ProcessTick(ExecutionMessage tick, List<Message> results)
+	/// <summary>
+	/// Move the book to a print.
+	/// </summary>
+	/// <param name="tick">The print.</param>
+	/// <param name="levelVolume">How much the synthesized levels hold.</param>
+	/// <param name="results">Where the messages go.</param>
+	public void ProcessTick(ExecutionMessage tick, decimal levelVolume, List<Message> results)
 	{
 		IsCandleMatchingMode = false;
 
@@ -1176,8 +926,8 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 		if (askPrice <= 0)
 			askPrice = tradePrice + (priceStep > 0 ? priceStep : tradePrice);
 
-		engineState.OrderBook.UpdateLevel(Sides.Buy, bidPrice, _emulatedLevelVolume);
-		engineState.OrderBook.UpdateLevel(Sides.Sell, askPrice, _emulatedLevelVolume);
+		engineState.OrderBook.UpdateLevel(Sides.Buy, bidPrice, levelVolume);
+		engineState.OrderBook.UpdateLevel(Sides.Sell, askPrice, levelVolume);
 
 		_synthBidPrice = bidPrice;
 		_synthAskPrice = askPrice;
@@ -1238,13 +988,18 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 		candles.Add(new(candle));
 	}
 
-	public void ProcessStoredCandles(DateTime currentTime, List<Message> results)
+	/// <summary>
+	/// Release the candles that have closed by <paramref name="currentTime"/>, and hand them back so
+	/// the caller can replay each as the prices it recorded.
+	/// </summary>
+	public List<CandleMessage> ProcessStoredCandles(DateTime currentTime, List<Message> results)
 	{
 		if (_storedCandles.Count == 0)
-			return;
+			return null;
 
 		var candleResults = new List<Message>();
 		List<DateTime> toRemove = null;
+		List<CandleMessage> released = null;
 
 		foreach (var pair in _storedCandles)
 		{
@@ -1281,7 +1036,7 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 				finalCandle.LocalTime = currentTime;
 				candleResults.Add(finalCandle);
 
-				ApplyCandleToOrderBook(candle, currentTime, candleResults);
+				(released ??= []).Add(candle);
 				pair.Value.Remove(stored);
 			}
 
@@ -1299,7 +1054,7 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 		}
 
 		if (candleResults.Count == 0)
-			return;
+			return released;
 
 		// A single trigger can release phases from several candle series. Keep those phases
 		// chronological while preserving the legacy position of candle output after any
@@ -1309,6 +1064,7 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 			.ToArray();
 
 		results.AddRange(ordered);
+		return released;
 	}
 
 	private static bool IsCandleCompleted(CandleMessage candle, DateTime currentTime)
@@ -1370,19 +1126,4 @@ internal class SecurityEmulator(MarketEmulator parent, MatchingEngineAdapter eng
 		}
 	}
 
-	private void ApplyCandleToOrderBook(CandleMessage candle, DateTime currentTime, List<Message> results)
-	{
-		IsCandleMatchingMode = true;
-
-		var engineState = GetEngineState();
-		var vol = candle.TotalVolume > 0 ? candle.TotalVolume / 2 : 10m;
-
-		engineState.OrderBook.UpdateLevel(Sides.Sell, candle.LowPrice, vol);
-		engineState.OrderBook.UpdateLevel(Sides.Buy, candle.HighPrice, vol);
-
-		if (_depthSubscription.HasValue)
-		{
-			results.Add(engineState.OrderBook.ToMessage(currentTime, currentTime));
-		}
-	}
 }

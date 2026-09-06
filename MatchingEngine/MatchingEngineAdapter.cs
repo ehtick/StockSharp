@@ -450,6 +450,36 @@ public class MatchingEngineAdapter : IMessageTransport
 		var matchResult = matcher.Match(order, state.OrderBook, matchSettings);
 
 		// Process result
+		EmitRegistrationResult(regMsg, order, matchResult, replyMsg, null, results);
+	}
+
+	/// <summary>
+	/// Turn a match into the messages it owes: the order rows, the trades, the maker side of each
+	/// fill, the positions and the portfolio updates.
+	/// </summary>
+	/// <remarks>
+	/// Shared with emulation. How a match was decided differs; what it owes does not.
+	/// </remarks>
+	/// <param name="regMsg">The registration this is answering.</param>
+	/// <param name="order">The order as the matcher saw it.</param>
+	/// <param name="matchResult">What the matcher decided.</param>
+	/// <param name="replyMsg">The acceptance row already published, mutated when the order ends here.</param>
+	/// <param name="chargeCommission">Prices a trade before the position is booked from it, or null.</param>
+	/// <param name="results">Where the messages go.</param>
+	public void EmitRegistrationResult(
+		OrderRegisterMessage regMsg,
+		EmulatorOrder order,
+		MatchResult matchResult,
+		ExecutionMessage replyMsg,
+		Func<ExecutionMessage, decimal?> chargeCommission,
+		List<Message> results)
+	{
+		var state = GetSecurityState(regMsg.SecurityId);
+		var portfolio = GetPortfolio(regMsg.PortfolioName);
+		var serverTime = regMsg.LocalTime;
+		var orderId = order.OrderId;
+		var marginPrice = order.MarginPrice;
+
 		if (matchResult.IsRejected)
 		{
 			portfolio.ProcessOrderCancellation(regMsg.SecurityId, regMsg.Side, regMsg.Volume, marginPrice);
@@ -473,25 +503,6 @@ public class MatchingEngineAdapter : IMessageTransport
 			: state.OrderBook.BestBid?.price;
 
 		// For IOC/FOK with trades, send Done message BEFORE trades
-		if ((isIOC || isFOK) && hasTrades)
-		{
-			results.Add(new ExecutionMessage
-			{
-				LocalTime = regMsg.LocalTime,
-				SecurityId = regMsg.SecurityId,
-				OrderId = orderId,
-				OriginalTransactionId = regMsg.TransactionId,
-				Balance = matchResult.RemainingVolume,
-				OrderVolume = regMsg.Volume,
-				OrderState = OrderStates.Done,
-				Side = regMsg.Side,
-				PortfolioName = regMsg.PortfolioName,
-				DataTypeEx = DataType.Transactions,
-				HasOrderInfo = true,
-				ServerTime = serverTime,
-			});
-		}
-
 		// Generate trades
 		foreach (var trade in matchResult.Trades)
 		{
@@ -513,8 +524,14 @@ public class MatchingEngineAdapter : IMessageTransport
 				MarketPrice = marketPrice,
 			};
 
-			var (realizedPnL, positionChange, position) = portfolio.ProcessTrade(
+			tradeMsg.Commission = chargeCommission?.Invoke(tradeMsg);
+
+			var (_, _, position) = portfolio.ProcessTrade(
 				regMsg.SecurityId, regMsg.Side, trade.Price, trade.Volume, tradeMsg.Commission);
+
+			// The fill before the state it produced: a reader releasing per-order state on a final
+			// state must still hold it when the trade arrives.
+			results.Add(tradeMsg);
 
 			// For non-IOC/FOK orders: send order state update in trade loop
 			if (!isIOC && !isFOK)
@@ -535,8 +552,6 @@ public class MatchingEngineAdapter : IMessageTransport
 					HasOrderInfo = true,
 				});
 			}
-
-			results.Add(tradeMsg);
 
 			// Position change. Named after the traded instrument, not money: the value carried
 			// here is a lot quantity, and the account's cash follows on its own row just below.
@@ -566,24 +581,6 @@ public class MatchingEngineAdapter : IMessageTransport
 					? state.OrderBook.BestAsk?.price
 					: state.OrderBook.BestBid?.price;
 
-				// The resting order's own state goes out ahead of its trade, the same order the taker's
-				// rows use, so a maker eaten to nothing reports a final state.
-				results.Add(new ExecutionMessage
-				{
-					DataTypeEx = DataType.Transactions,
-					LocalTime = regMsg.LocalTime,
-					ServerTime = serverTime,
-					SecurityId = regMsg.SecurityId,
-					OrderId = counterOrder.OrderId,
-					OriginalTransactionId = counterOrder.TransactionId,
-					Balance = fill.Remaining,
-					OrderVolume = counterOrder.Volume,
-					OrderState = fill.Remaining <= 0 ? OrderStates.Done : OrderStates.Active,
-					Side = counterOrder.Side,
-					PortfolioName = counterOrder.PortfolioName,
-					HasOrderInfo = true,
-				});
-
 				var counterTradeMsg = new ExecutionMessage
 				{
 					DataTypeEx = DataType.Transactions,
@@ -605,6 +602,23 @@ public class MatchingEngineAdapter : IMessageTransport
 
 				results.Add(counterTradeMsg);
 
+				// The maker's state follows its trade, the same order the taker's rows use.
+				results.Add(new ExecutionMessage
+				{
+					DataTypeEx = DataType.Transactions,
+					LocalTime = regMsg.LocalTime,
+					ServerTime = serverTime,
+					SecurityId = regMsg.SecurityId,
+					OrderId = counterOrder.OrderId,
+					OriginalTransactionId = counterOrder.TransactionId,
+					Balance = fill.Remaining,
+					OrderVolume = counterOrder.Volume,
+					OrderState = fill.Remaining <= 0 ? OrderStates.Done : OrderStates.Active,
+					Side = counterOrder.Side,
+					PortfolioName = counterOrder.PortfolioName,
+					HasOrderInfo = true,
+				});
+
 				results.Add(new PositionChangeMessage
 				{
 					SecurityId = regMsg.SecurityId,
@@ -621,6 +635,26 @@ public class MatchingEngineAdapter : IMessageTransport
 				if (fill.Remaining <= 0)
 					state.OrderManager.TryRemoveOrder(counterOrder.TransactionId, out _);
 			}
+		}
+
+		// After the fills, not before them - see the taker rows above.
+		if ((isIOC || isFOK) && hasTrades)
+		{
+			results.Add(new ExecutionMessage
+			{
+				LocalTime = regMsg.LocalTime,
+				SecurityId = regMsg.SecurityId,
+				OrderId = orderId,
+				OriginalTransactionId = regMsg.TransactionId,
+				Balance = matchResult.RemainingVolume,
+				OrderVolume = regMsg.Volume,
+				OrderState = OrderStates.Done,
+				Side = regMsg.Side,
+				PortfolioName = regMsg.PortfolioName,
+				DataTypeEx = DataType.Transactions,
+				HasOrderInfo = true,
+				ServerTime = serverTime,
+			});
 		}
 
 		// Handle the cancelled portion of an order that cannot rest
@@ -683,6 +717,7 @@ public class MatchingEngineAdapter : IMessageTransport
 			results.Add(state.OrderBook.ToMessage(regMsg.LocalTime, serverTime));
 		}
 	}
+
 
 	/// <summary>
 	/// Process order cancellation.
